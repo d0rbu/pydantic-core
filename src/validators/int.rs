@@ -4,13 +4,15 @@ use num_bigint::BigInt;
 use pyo3::exceptions::PyValueError;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString};
+use pyo3::types::{PyDict, PyInt, PyString};
 use pyo3::IntoPyObjectExt;
 
 use crate::build_tools::is_strict;
 use crate::build_tools::LazyLock;
 use crate::errors::{ErrorType, ValError, ValResult};
 use crate::input::{Input, Int};
+use crate::tools::extract_i64;
+use crate::validators::Exactness;
 
 use super::{BuildValidator, CombinedValidator, DefinitionsBuilder, ValidationState, Validator};
 
@@ -97,6 +99,35 @@ pub struct ConstrainedIntValidator {
 }
 
 impl ConstrainedIntValidator {
+    pub(super) fn is_nonnegative_only(&self) -> bool {
+        matches!(self.ge, Some(Int::I64(0)))
+            && self.multiple_of.is_none()
+            && self.le.is_none()
+            && self.lt.is_none()
+            && self.gt.is_none()
+    }
+
+    pub(super) fn validate_nonnegative<'py>(
+        &self,
+        py: Python<'py>,
+        input: &(impl Input<'py> + ?Sized),
+        state: &mut ValidationState<'_, 'py>,
+    ) -> ValResult<Py<PyAny>> {
+        // The tuple selects this method only for the exact ge=0-only schema.
+        // Other values retain all original coercion, overflow and error behavior.
+        if let Some(value) = input.as_python() {
+            if value.is_exact_instance_of::<PyInt>() {
+                if let Some(integer) = extract_i64(value) {
+                    if integer >= 0 {
+                        state.floor_exactness(Exactness::Exact);
+                        return Ok(value.clone().unbind());
+                    }
+                }
+            }
+        }
+        self.validate(py, input, state)
+    }
+
     fn build(schema: &Bound<'_, PyDict>, config: Option<&Bound<'_, PyDict>>) -> PyResult<Arc<CombinedValidator>> {
         let py = schema.py();
         Ok(CombinedValidator::ConstrainedInt(Self {

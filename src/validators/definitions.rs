@@ -12,7 +12,39 @@ use crate::input::Input;
 use crate::recursion_guard::RecursionGuard;
 use crate::tools::SchemaDict;
 
+use super::int::ConstrainedIntValidator;
 use super::{build_validator, BuildValidator, CombinedValidator, DefinitionsBuilder, ValidationState, Validator};
+
+#[derive(Clone, Copy)]
+pub(super) enum ResolvedDefinitionValidator<'a> {
+    General(&'a DefinitionRefValidator, &'a CombinedValidator),
+    Nonnegative(&'a DefinitionRefValidator, &'a ConstrainedIntValidator),
+}
+
+impl<'a> ResolvedDefinitionValidator<'a> {
+    pub(super) fn new(reference: &'a DefinitionRefValidator, validator: &'a CombinedValidator) -> Self {
+        match validator {
+            CombinedValidator::ConstrainedInt(integer) if integer.is_nonnegative_only() => {
+                Self::Nonnegative(reference, integer)
+            }
+            _ => Self::General(reference, validator),
+        }
+    }
+
+    pub(super) fn validate<'py>(
+        self,
+        py: Python<'py>,
+        input: &(impl Input<'py> + ?Sized),
+        state: &mut ValidationState<'_, 'py>,
+    ) -> ValResult<Py<PyAny>> {
+        match self {
+            Self::General(reference, validator) => reference.validate_with_definition(py, input, state, validator),
+            Self::Nonnegative(reference, integer) => {
+                reference.validate_with(input, state, |state| integer.validate_nonnegative(py, input, state))
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DefinitionsValidatorBuilder;
@@ -51,6 +83,38 @@ impl DefinitionRefValidator {
     pub fn new(definition: DefinitionRef<Arc<CombinedValidator>>) -> Self {
         Self { definition }
     }
+
+    pub(super) fn with_definition<R>(&self, f: impl FnOnce(&CombinedValidator) -> R) -> R {
+        self.definition.read(|validator| f(validator.unwrap()))
+    }
+
+    pub(super) fn validate_with_definition<'py>(
+        &self,
+        py: Python<'py>,
+        input: &(impl Input<'py> + ?Sized),
+        state: &mut ValidationState<'_, 'py>,
+        validator: &CombinedValidator,
+    ) -> ValResult<Py<PyAny>> {
+        self.validate_with(input, state, |state| validator.validate(py, input, state))
+    }
+
+    fn validate_with<'py>(
+        &self,
+        input: &(impl Input<'py> + ?Sized),
+        state: &mut ValidationState<'_, 'py>,
+        validate: impl FnOnce(&mut ValidationState<'_, 'py>) -> ValResult<Py<PyAny>>,
+    ) -> ValResult<Py<PyAny>> {
+        // Each item still owns its original partial-validation and recursion state.
+        state.allow_partial = false.into();
+        if let Some(id) = input.as_python().map(py_identity) {
+            let Ok(mut guard) = RecursionGuard::new(state, id, self.definition.id()) else {
+                return Err(ValError::new(ErrorTypeDefaults::RecursionLoop, input));
+            };
+            validate(guard.state())
+        } else {
+            validate(state)
+        }
+    }
 }
 
 impl BuildValidator for DefinitionRefValidator {
@@ -77,21 +141,7 @@ impl Validator for DefinitionRefValidator {
         input: &(impl Input<'py> + ?Sized),
         state: &mut ValidationState<'_, 'py>,
     ) -> ValResult<Py<PyAny>> {
-        // this validator does not yet support partial validation, disable it to avoid incorrect results
-        state.allow_partial = false.into();
-
-        self.definition.read(|validator| {
-            let validator = validator.unwrap();
-            if let Some(id) = input.as_python().map(py_identity) {
-                // Python objects can be cyclic, so need recursion guard
-                let Ok(mut guard) = RecursionGuard::new(state, id, self.definition.id()) else {
-                    return Err(ValError::new(ErrorTypeDefaults::RecursionLoop, input));
-                };
-                validator.validate(py, input, guard.state())
-            } else {
-                validator.validate(py, input, state)
-            }
-        })
+        self.with_definition(|validator| self.validate_with_definition(py, input, state, validator))
     }
 
     fn default_value<'py>(

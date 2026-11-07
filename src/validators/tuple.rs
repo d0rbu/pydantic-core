@@ -11,6 +11,7 @@ use crate::input::ConsumeIterator;
 use crate::input::{BorrowInput, Input, ValidatedTuple};
 use crate::tools::SchemaDict;
 
+use super::definitions::ResolvedDefinitionValidator;
 use super::{build_validator, BuildValidator, CombinedValidator, DefinitionsBuilder, ValidationState, Validator};
 
 #[derive(Debug)]
@@ -112,6 +113,7 @@ impl TupleValidator {
         errors: &mut Vec<ValLineError>,
         collection_iter: &mut NextCountingIterator<impl Iterator<Item = I>>,
         actual_length: Option<usize>,
+        resolved_definition: Option<ResolvedDefinitionValidator<'_>>,
     ) -> ValResult<Vec<Py<PyAny>>> {
         let expected_length = if self.variadic_item_index.is_some() {
             actual_length.unwrap_or(self.validators.len())
@@ -146,7 +148,11 @@ impl TupleValidator {
             let n_tail_validators = tail_validators.len();
             if n_tail_validators == 0 {
                 for (index, input_item) in collection_iter {
-                    match variable_validator.validate(py, input_item.borrow_input(), state) {
+                    let result = match resolved_definition {
+                        Some(validator) => validator.validate(py, input_item.borrow_input(), state),
+                        None => variable_validator.validate(py, input_item.borrow_input(), state),
+                    };
+                    match result {
                         Ok(item) => self.push_output_item(input, &mut output, item, actual_length)?,
                         Err(ValError::LineErrors(line_errors)) => {
                             errors.extend(line_errors.into_iter().map(|err| err.with_outer_location(index)));
@@ -333,7 +339,24 @@ where
     I: Input<'py> + ?Sized,
 {
     type Output = ValResult<Vec<Py<PyAny>>>;
-    fn consume_iterator(self, mut iterator: impl Iterator<Item = PyResult<T>>) -> ValResult<Vec<Py<PyAny>>> {
+    fn consume_iterator(self, iterator: impl Iterator<Item = PyResult<T>>) -> ValResult<Vec<Py<PyAny>>> {
+        if self.validator.variadic_item_index == Some(0) && self.validator.validators.len() == 1 {
+            if let CombinedValidator::DefinitionRef(reference) = self.validator.validators[0].as_ref() {
+                return reference.with_definition(|validator| {
+                    self.consume_with_definition(iterator, Some(ResolvedDefinitionValidator::new(reference, validator)))
+                });
+            }
+        }
+        self.consume_with_definition(iterator, None)
+    }
+}
+
+impl<'py, I: Input<'py> + ?Sized> ValidateToTuple<'_, '_, 'py, I> {
+    fn consume_with_definition<T: BorrowInput<'py>>(
+        self,
+        mut iterator: impl Iterator<Item = PyResult<T>>,
+        resolved_definition: Option<ResolvedDefinitionValidator<'_>>,
+    ) -> ValResult<Vec<Py<PyAny>>> {
         let mut iteration_error = None;
 
         let output = self.validator.validate_tuple_variable(
@@ -370,6 +393,7 @@ where
                 0,
             ),
             self.actual_length,
+            resolved_definition,
         )?;
 
         if let Some(err) = iteration_error {
