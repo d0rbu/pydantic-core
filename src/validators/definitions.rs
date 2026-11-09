@@ -22,6 +22,13 @@ pub(super) enum ResolvedDefinitionValidator<'a> {
 }
 
 impl<'a> ResolvedDefinitionValidator<'a> {
+    pub(super) fn is_strict_nonnegative(self, state: &ValidationState<'_, '_>) -> bool {
+        match self {
+            Self::Nonnegative(_, integer) => integer.is_strict_for(state),
+            Self::General(_, _) => false,
+        }
+    }
+
     pub(super) fn new(reference: &'a DefinitionRefValidator, validator: &'a CombinedValidator) -> Self {
         match validator {
             CombinedValidator::ConstrainedInt(integer) if integer.is_nonnegative_only() => {

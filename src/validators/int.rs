@@ -99,6 +99,10 @@ pub struct ConstrainedIntValidator {
 }
 
 impl ConstrainedIntValidator {
+    pub(super) fn is_strict_for(&self, state: &ValidationState<'_, '_>) -> bool {
+        state.strict_or(self.strict)
+    }
+
     pub(super) fn is_nonnegative_only(&self) -> bool {
         matches!(self.ge, Some(Int::I64(0)))
             && self.multiple_of.is_none()

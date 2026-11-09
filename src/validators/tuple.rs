@@ -63,6 +63,49 @@ impl BuildValidator for TupleValidator {
 impl_py_gc_traverse!(TupleValidator { validators });
 
 impl TupleValidator {
+    fn validate_python_integer_tuple<'py>(
+        &self,
+        py: Python<'py>,
+        input: &(impl Input<'py> + ?Sized),
+        tuple: &Bound<'py, PyTuple>,
+        validator: ResolvedDefinitionValidator<'_>,
+        state: &mut ValidationState<'_, 'py>,
+    ) -> ValResult<Py<PyAny>> {
+        // This admitted shape has one repeated validator, no tail, no maximum,
+        // and no fail-fast option. Keep the ordinary output allocation and each
+        // original scalar/recursion validation while selecting that loop once.
+        let mut output = Vec::with_capacity(tuple.len());
+        let mut errors = Vec::new();
+        for (index, item) in tuple.iter().enumerate() {
+            match validator.validate(py, &item, state) {
+                Ok(value) => output.push(value),
+                Err(ValError::LineErrors(line_errors)) => {
+                    errors.extend(line_errors.into_iter().map(|err| err.with_outer_location(index)));
+                }
+                Err(ValError::Omit) => (),
+                Err(err) => return Err(err),
+            }
+        }
+        if let Some(min_length) = self.min_length {
+            if output.len() < min_length {
+                errors.push(ValLineError::new(
+                    ErrorType::TooShort {
+                        field_type: "Tuple".to_string(),
+                        min_length,
+                        actual_length: output.len(),
+                        context: None,
+                    },
+                    input,
+                ));
+            }
+        }
+        if errors.is_empty() {
+            Ok(PyTuple::new(py, output)?.into())
+        } else {
+            Err(ValError::LineErrors(errors))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn validate_tuple_items<'py, I: BorrowInput<'py>>(
         &self,
@@ -285,6 +328,27 @@ impl Validator for TupleValidator {
 
         let collection = input.validate_tuple(state.strict_or(self.strict))?.unpack(state);
         let actual_length = collection.len();
+
+        if self.variadic_item_index == Some(0)
+            && self.validators.len() == 1
+            && self.max_length.is_none()
+            && !self.fail_fast
+        {
+            if let (Some(value), CombinedValidator::DefinitionRef(reference)) =
+                (input.as_python(), self.validators[0].as_ref())
+            {
+                if let Ok(tuple) = value.downcast_exact::<PyTuple>() {
+                    if let Some(result) = reference.with_definition(|definition| {
+                        let validator = ResolvedDefinitionValidator::new(reference, definition);
+                        validator
+                            .is_strict_nonnegative(state)
+                            .then(|| self.validate_python_integer_tuple(py, input, tuple, validator, state))
+                    }) {
+                        return result;
+                    }
+                }
+            }
+        }
 
         let mut errors: Vec<ValLineError> = Vec::new();
 
